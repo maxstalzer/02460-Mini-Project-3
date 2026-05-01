@@ -10,10 +10,12 @@ from torch_geometric.utils import to_networkx
 from collections import Counter
 import pickle
 
-device = 'cpu'
+print("Hello")
+
+device = 'cuda'
 
 # Load the MUTAG dataset
-dataset = TUDataset(root='./data/', name='MUTAG').to(device)
+dataset = TUDataset(root='./data/', name='MUTAG')
 node_feature_dim = 7
 
 # Split into training and validation
@@ -104,11 +106,11 @@ class GNNEncoder(torch.nn.Module):
         return mu, logstd
 
 class GraphVAE(torch.nn.Module):
-    def __init__(self, encoder, latent_dim): # <-- Added latent_dim here
+    def __init__(self, encoder, latent_dim):
         super().__init__()
         self.encoder = encoder
         
-        # NEW: MLP Decoder to replace the simple dot product
+        # MLP Decoder to replace the simple dot product
         self.decoder_net = torch.nn.Sequential(
             torch.nn.Linear(latent_dim * 2, latent_dim),
             torch.nn.ReLU(),

@@ -135,4 +135,4 @@ plot_hist_column(2, emp_eig, base_eig, deep_eig, 'Eigenvector Centrality')
 
 # h_pad adds vertical space between rows, w_pad adds horizontal space between columns
 plt.tight_layout(rect=[0, 0.03, 1, 0.95], h_pad=3.0, w_pad=1.5)
-plt.show()
+plt.savefig("Histograms.png")
