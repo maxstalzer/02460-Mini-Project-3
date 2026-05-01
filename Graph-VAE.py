@@ -143,35 +143,62 @@ class GraphVAE(torch.nn.Module):
         adj_logits = (adj_logits + adj_logits.t()) / 2.0
         
         # Squash to probabilities
-        return torch.sigmoid(adj_logits)
+        return adj_logits, torch.sigmoid(adj_logits)
 
     def forward(self, x, edge_index):
         mu, logstd = self.encoder(x, edge_index)
         z = self.reparameterize(mu, logstd)
-        adj_recon = self.decode(z)
-        return adj_recon, mu, logstd
+        adj_logits, adj_prob = self.decode(z)
+        return adj_logits, adj_prob, mu, logstd
 
-def compute_elbo_loss(adj_recon, edge_index, mu, logstd, batch, kl_beta):
+def compute_elbo_loss(adj_logits, edge_index, mu, logstd, batch, kl_beta):
     num_nodes = batch.shape[0]
-    true_adj = torch.zeros((num_nodes, num_nodes), device=adj_recon.device)
+    true_adj = torch.zeros((num_nodes, num_nodes), device=adj_logits.device)
     true_adj[edge_index[0], edge_index[1]] = 1.0
 
     same_graph_mask = batch.unsqueeze(0) == batch.unsqueeze(1)
     
-    pred_probs = adj_recon[same_graph_mask]
+    # ---------------------------------------------------------
+    # 1. RECONSTRUCTION LOSS (Works fine flattened)
+    # ---------------------------------------------------------
+    pred_logits = adj_logits[same_graph_mask]
     true_labels = true_adj[same_graph_mask]
 
-    # Reverted to standard BCE. The decoder_bias handles the sparsity now.
-    recon_loss = F.binary_cross_entropy(
-        pred_probs, 
-        true_labels, 
+    num_possible = true_labels.numel()
+    num_edges = true_labels.sum()
+    pos_weight = (num_possible - num_edges) / (num_edges + 1e-6)
+
+    recon_loss = F.binary_cross_entropy_with_logits(
+        pred_logits, 
+        true_labels,
+        pos_weight=pos_weight,
         reduction='sum'
     )
 
+    # ---------------------------------------------------------
+    # 2. DEGREE LOSS (Must preserve 2D shape to sum across rows)
+    # ---------------------------------------------------------
+    # # Get full NxN probabilities
+    # full_pred_probs = torch.sigmoid(adj_logits)
+    
+    # # Zero out edges that connect different graphs in the batch
+    # valid_pred_probs = full_pred_probs * same_graph_mask.float()
+    
+    # # Sum along rows to get the expected degree per node
+    # expected_degrees = valid_pred_probs.sum(dim=1)
+    # true_degrees = (true_adj * same_graph_mask.float()).sum(dim=1)
+    
+    # # Calculate MSE penalty
+    # degree_loss = F.mse_loss(expected_degrees, true_degrees, reduction='sum')
+
+    # ---------------------------------------------------------
+    # 3. KL DIVERGENCE
+    # ---------------------------------------------------------
     kl_loss = -0.5 * torch.sum(1 + logstd - mu.pow(2) - logstd.exp())
 
-    num_graphs = batch.max().item() + 1
-    total_loss = (recon_loss + kl_beta * kl_loss) / num_graphs 
+    # Combine everything
+    # total_loss = (recon_loss + (0.2 * degree_loss) + kl_beta * kl_loss) 
+    total_loss = (recon_loss + kl_beta * kl_loss) 
     
     return total_loss
 
@@ -184,7 +211,7 @@ latent_dim = 16
 state_dim = 32
 num_message_passing_rounds = 3
 learning_rate = 1e-3
-num_epochs = 1000
+num_epochs = 2000
 
 # Initialize Models
 encoder = GNNEncoder(
@@ -211,12 +238,12 @@ for epoch in range(1, num_epochs + 1):
         batch_data = batch_data.to(device)
         optimizer.zero_grad()
 
-        # Forward pass
-        adj_recon, mu, logstd = model(batch_data.x, batch_data.edge_index)
+        # Forward pass (catch 4 variables now)
+        adj_logits, adj_prob, mu, logstd = model(batch_data.x, batch_data.edge_index)
 
-        # Compute ELBO
-        loss = compute_elbo_loss(adj_recon, batch_data.edge_index, mu, logstd, batch_data.batch, kl_beta=current_beta)
-
+        # Compute ELBO (pass adj_logits instead of adj_recon)
+        loss = compute_elbo_loss(adj_logits, batch_data.edge_index, mu, logstd, batch_data.batch, kl_beta=current_beta)
+        
         # Backpropagation
         loss.backward()
         optimizer.step()
@@ -252,16 +279,26 @@ with torch.no_grad(): # We don't need gradients for generation
         # We bypass the encoder entirely because the VAE has learned to map this 
         # standard distribution to meaningful graph structures!
         z = torch.randn((n, latent_dim)).to(device)
-        
-        # 3. Decode to get the NxN matrix of edge probabilities[cite: 1]
-        adj_prob = model.decode(z)
-        
-        # 4. Convert probabilities to discrete edges
-        # We use Bernoulli sampling. If adj_prob is 0.8, there is an 80% chance of an edge.
-        adj_discrete = torch.bernoulli(adj_prob)
 
-        # ALTERNATIVELY: Use a hard threshold (e.g., 0.5) to capture the model's highest-confidence edges
-        # adj_discrete = (adj_prob > 0.5).float()
+        # 3. Decode to get the NxN matrix of edge probabilities
+        # Use an underscore to ignore the raw logits returned by decode
+        _, adj_prob = model.decode(z)
+        
+        # # Force the graph to have roughly the right number of edges.
+        # # MUTAG graphs have an average edge density of about ~20-25%.
+        # # Let's take the top 25% most probable edges, ensuring the strongest connections survive.
+        
+        # N = adj_prob.shape[0]
+        # num_edges_to_keep = int((N * N) * 0.15) # Adjust this 0.25 up or down!
+        
+        # # Flatten, find the threshold value for the top K edges, and apply it
+        # flat_probs = adj_prob.view(-1)
+        # threshold = torch.topk(flat_probs, num_edges_to_keep).values[-1]
+        
+        # adj_discrete = (adj_prob >= threshold).float()
+
+        # # 4. Convert probabilities to discrete edges
+        adj_discrete = torch.bernoulli(adj_prob)
         
         # 5. Clean up the Adjacency Matrix
         # MUTAG graphs are undirected and don't have self-loops.
@@ -271,7 +308,15 @@ with torch.no_grad(): # We don't need gradients for generation
         
         # 6. Convert the PyTorch tensor to a NetworkX graph object
         G = nx.from_numpy_array(adj_discrete.cpu().numpy())
-        deep_graphs_nx.append(G)
+        
+        # Only keep the Largest Connected Component (LCC)
+        # if len(G.nodes) > 0:
+        #     largest_cc = max(nx.connected_components(G), key=len)
+        #     G = G.subgraph(largest_cc).copy()
+
+        # Only append if the graph didn't completely collapse
+        if G.number_of_nodes() > 2:
+            deep_graphs_nx.append(G)
 
 print(f"Successfully generated {len(deep_graphs_nx)} deep generative graphs! :)")
 

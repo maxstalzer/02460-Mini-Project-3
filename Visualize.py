@@ -97,10 +97,13 @@ def compute_stats(graph_list):
             
     return degrees, clusterings, eigenvectors
 
-# Compute stats for all three datasets[cite: 1]
+# Compute stats for all three datasets
 emp_deg, emp_clust, emp_eig = compute_stats(train_graphs_nx)
 base_deg, base_clust, base_eig = compute_stats(baseline_graphs)
 deep_deg, deep_clust, deep_eig = compute_stats(deep_graphs)
+
+print(f"Baseline mean degree: {np.mean(base_deg):.3f}")
+print(f"Deep mean degree: {np.mean(deep_deg):.3f}")
 
 
 # =====================================================================
@@ -112,7 +115,7 @@ fig.suptitle('Graph Statistics Comparison', fontsize=16)
 
 def plot_hist_column(ax_col, data_emp, data_base, data_deep, title):
     """Plots a single metric down a column for all three models using shared bins."""
-    # Compute shared bins across ALL distributions to make visual comparison easy[cite: 1]
+    # Compute shared bins across ALL distributions to make visual comparison easy
     all_data = data_emp + data_base + data_deep
     bins = np.histogram_bin_edges(all_data, bins=30)
     
